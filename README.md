@@ -10,11 +10,14 @@ The repository contains a reusable source patch and the complete build/test reco
 
 ## 1. Problem and root cause
 
-Typical upstream error:
+Actual error example (only one example per error class):
 
 ```text
-Invalid request: an assistant message with 'tool_calls' must be followed
-by tool messages responding to each 'tool_call_id'.
+CC Switch local proxy failed while handling Codex endpoint /responses.
+Provider: Kimi For Coding; model: ccs-kimi/k3.1-pro; upstream_status: HTTP 400;
+cause: Invalid request: an assistant message with 'tool_calls' must be followed
+by tool messages responding to each 'tool_call_id'. The following tool_call_ids
+did not have response messages: view_image:71, view_image:72, view_image:73
 ```
 
 The failure usually occurs after the model reads images during a turn, not when images are first attached. A typical persisted sequence is:
@@ -105,13 +108,20 @@ A matching Codex CLI 0.167.0-alpha.4.1 source patch was drafted to defer resize 
 
 1. Initial Rust test builds failed because of machine memory/page-file pressure; limiting `CARGO_BUILD_JOBS` to 1 allowed the build to finish.
 2. The first executable was produced with `cargo build --release`, which is not a complete Tauri application build.
-3. Replacing the installed executable with that output led to a localhost page-connection failure.
+3. Replacing the installed executable with that output led to a localhost page-connection failure, represented by `ERR_CONNECTION_REFUSED`. This deployment failure is distinct from Kimi tool pairing.
 4. The backed-up original executable was restored, its SHA-256 matched the backup, and port 4000 recovered.
 5. The build was then repeated with `pnpm tauri build`, including the frontend. Cargo-only output is no longer used for deployment.
 
 ### 5.5 Full build and internal-receipt compatibility
 
-The full Tauri build produced a working interface and a functioning port 4000. The first new-thread test then exposed a `create_thread` internal receipt without a `call_id`, which the patch incorrectly rejected as `tool item is missing call_id`.
+The full Tauri build produced a working interface and a functioning port 4000. The first new-thread test then exposed a `create_thread` internal receipt without a `call_id`, which the patch incorrectly rejected:
+
+```text
+CC Switch local proxy failed while handling Codex endpoint /responses.
+Provider: Kimi For Coding; model: ccs-kimi/k3.1-pro;
+cause: 无效的请求: tool item is missing call_id
+```
+
 
 Validation was narrowed to calls and outputs with real non-empty `call_id` values. Internal receipts remain unchanged. The target suite grew from four to five tests, all passing.
 

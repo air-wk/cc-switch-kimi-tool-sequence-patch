@@ -10,11 +10,14 @@
 
 ## 1. 问题与根因
 
-典型错误：
+实际错误示例（同类只列一个）：
 
 ```text
-Invalid request: an assistant message with 'tool_calls' must be followed
-by tool messages responding to each 'tool_call_id'.
+CC Switch local proxy failed while handling Codex endpoint /responses.
+Provider: Kimi For Coding; model: ccs-kimi/k3.1-pro; upstream_status: HTTP 400;
+cause: Invalid request: an assistant message with 'tool_calls' must be followed
+by tool messages responding to each 'tool_call_id'. The following tool_call_ids
+did not have response messages: view_image:71, view_image:72, view_image:73
 ```
 
 问题通常不发生在第一次发送图片，而发生在模型回答中途调用 `view_image` 后。典型原始顺序：
@@ -105,13 +108,20 @@ Codex → CC Switch 4000
 
 1. 目标 Rust 测试最初因整机内存/页面文件不足失败；将 `CARGO_BUILD_JOBS` 限制为 1 后完成。
 2. 最初直接使用 `cargo build --release` 生成 exe，但这不等于完整 Tauri 应用构建。
-3. 替换后曾出现 localhost 页面连接失败，立即使用备份恢复原 exe。
+3. 替换后曾出现 localhost 页面连接失败，立即使用备份恢复原 exe。该部署错误的代表信息为 `ERR_CONNECTION_REFUSED`，与 Kimi 工具配对错误不是同一类。
 4. 恢复后原文件 SHA-256 与备份一致，4000 服务恢复。
 5. 随后改用 `pnpm tauri build`，先构建前端，再生成完整应用。仅依赖 Cargo 的输出不再用于部署。
 
 ### 5.5 完整构建与内部回执兼容
 
-完整 Tauri 构建后，界面和 4000 服务正常。首次新对话测试发现 `create_thread` 内部回执没有 `call_id`，补丁误报 `tool item is missing call_id`。
+完整 Tauri 构建后，界面和 4000 服务正常。首次新对话测试发现 `create_thread` 内部回执没有 `call_id`，补丁误报：
+
+```text
+CC Switch local proxy failed while handling Codex endpoint /responses.
+Provider: Kimi For Coding; model: ccs-kimi/k3.1-pro;
+cause: 无效的请求: tool item is missing call_id
+```
+
 
 随后调整校验：只配对具有真实非空 `call_id` 的工具调用/输出，内部回执保持原样。新增对应测试后，目标测试从 4 项增加到 5 项，全部通过。
 
