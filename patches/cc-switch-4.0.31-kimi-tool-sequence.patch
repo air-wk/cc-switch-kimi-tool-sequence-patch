@@ -1,0 +1,216 @@
+diff --git a/src-tauri/src/proxy/forwarder.rs b/src-tauri/src/proxy/forwarder.rs
+index 5aa39f8..e65fc02 100644
+--- a/src-tauri/src/proxy/forwarder.rs
++++ b/src-tauri/src/proxy/forwarder.rs
+@@ -1668,6 +1668,15 @@ impl RequestForwarder {
+ 
+         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
+         let mut mapped_body = normalize_thinking_type(mapped_body);
++        if matches!(app_type, AppType::Codex) {
++            let repaired = super::tool_sequence_guard::normalize_codex_kimi_tool_sequence(
++                &mut mapped_body,
++            )
++            .map_err(ProxyError::InvalidRequest)?;
++            if repaired > 0 {
++                log::info!("[Codex] Normalized {repaired} Kimi tool-history item(s)");
++            }
++        }
+         // 隐私过滤第一遍：必须在 Copilot 分类 / 合并和内容派生的请求 ID 之前
+         self.apply_privacy_filter(app_type, &mut mapped_body, "client");
+         let is_copilot_codex_responses = matches!(app_type, AppType::Codex)
+diff --git a/src-tauri/src/proxy/mod.rs b/src-tauri/src/proxy/mod.rs
+index 4ee851e..37c2c81 100644
+--- a/src-tauri/src/proxy/mod.rs
++++ b/src-tauri/src/proxy/mod.rs
+@@ -39,6 +39,7 @@ pub mod thinking_budget_rectifier;
+ pub mod thinking_optimizer;
+ pub mod thinking_rectifier;
+ pub(crate) mod tool_media;
++pub(crate) mod tool_sequence_guard;
+ pub(crate) mod types;
+ mod upstream_guard;
+ pub mod usage;
+diff --git a/src-tauri/src/proxy/tool_sequence_guard.rs b/src-tauri/src/proxy/tool_sequence_guard.rs
+new file mode 100644
+index 0000000..66d82b5
+--- /dev/null
++++ b/src-tauri/src/proxy/tool_sequence_guard.rs
+@@ -0,0 +1,178 @@
++use serde_json::Value;
++use std::collections::{BTreeMap, BTreeSet};
++
++fn is_kimi_model(model: &str) -> bool {
++    let name = model.rsplit('/').next().unwrap_or(model).to_lowercase();
++    name.contains("kimi")
++        || ["k2.", "k2-", "k3.", "k3-"]
++            .iter()
++            .any(|prefix| name.starts_with(prefix))
++}
++
++fn item_type(item: &Value) -> &str {
++    item.get("type").and_then(Value::as_str).unwrap_or("")
++}
++
++fn call_id(item: &Value) -> Option<String> {
++    item.get("call_id")
++        .and_then(Value::as_str)
++        .filter(|id| !id.is_empty())
++        .map(ToString::to_string)
++}
++
++fn validate_pairs(items: &[Value]) -> Result<(), String> {
++    let mut calls = BTreeMap::new();
++    let mut outputs = BTreeMap::new();
++    for item in items {
++        match item_type(item) {
++            "function_call" => if let Some(id) = call_id(item) { *calls.entry(id).or_insert(0) += 1 },
++            "function_call_output" => if let Some(id) = call_id(item) { *outputs.entry(id).or_insert(0) += 1 },
++            _ => {}
++        }
++    }
++    if calls.values().any(|count| *count != 1)
++        || outputs.values().any(|count| *count != 1)
++        || calls.keys().ne(outputs.keys())
++    {
++        return Err(format!(
++            "tool call/output mismatch: calls={calls:?}, outputs={outputs:?}"
++        ));
++    }
++    Ok(())
++}
++
++/// Moves injected items behind the complete tool-output batch, before either
++/// native Responses forwarding or Responses -> Chat conversion.
++pub(crate) fn normalize_codex_kimi_tool_sequence(body: &mut Value) -> Result<usize, String> {
++    if !body
++        .get("model")
++        .and_then(Value::as_str)
++        .is_some_and(is_kimi_model)
++    {
++        return Ok(0);
++    }
++    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
++        return Ok(0);
++    };
++    validate_pairs(input)?;
++    let original = std::mem::take(input);
++    let mut normalized = Vec::with_capacity(original.len());
++    let mut moved = 0;
++    let mut index = 0;
++    while index < original.len() {
++        if item_type(&original[index]) != "function_call" {
++            normalized.push(original[index].clone());
++            index += 1;
++            continue;
++        }
++        let batch_start = index;
++        let mut calls = Vec::new();
++        let mut outputs = Vec::new();
++        let mut extras = Vec::new();
++        let mut pending = BTreeSet::new();
++        while index < original.len() {
++            let item = &original[index];
++            match item_type(item) {
++                "function_call" if call_id(item).is_some() => {
++                    pending.insert(call_id(item).unwrap());
++                    calls.push(item.clone());
++                }
++                "function_call_output" if call_id(item).is_some() => {
++                    pending.remove(&call_id(item).unwrap());
++                    outputs.push(item.clone());
++                }
++                _ => {
++                    if item.get("role").and_then(Value::as_str) == Some("user") {
++                        break;
++                    }
++                    extras.push(item.clone());
++                }
++            }
++            index += 1;
++            if pending.is_empty() {
++                break;
++            }
++        }
++        if !pending.is_empty() {
++            return Err(format!(
++                "user message arrived before tool outputs: {pending:?}"
++            ));
++        }
++        let mut batch = calls;
++        batch.extend(outputs);
++        batch.extend(extras);
++        if batch.as_slice() != &original[batch_start..index] {
++            moved += 1;
++        }
++        normalized.extend(batch);
++    }
++    *input = normalized;
++    Ok(moved)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    fn call(id: &str) -> Value {
++        json!({"type":"function_call","call_id":id,"name":"view_image","arguments":"{}"})
++    }
++
++    fn output(id: &str) -> Value {
++        json!({"type":"function_call_output","call_id":id,"output":"ok"})
++    }
++
++    fn notice() -> Value {
++        json!({"type":"message","role":"developer","content":[{"type":"input_text","text":"resize"}]})
++    }
++
++    fn user() -> Value {
++        json!({"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]})
++    }
++
++    #[test]
++    fn moves_notice_behind_parallel_tool_outputs() {
++        let mut body = json!({"model":"kimi-k3.1-pro","input":[call("a"),call("b"),output("a"),notice(),output("b"),user()]});
++        assert_eq!(normalize_codex_kimi_tool_sequence(&mut body), Ok(1));
++        let types: Vec<_> = body["input"].as_array().unwrap().iter().map(item_type).collect();
++        assert_eq!(types, ["function_call","function_call","function_call_output","function_call_output","message","message"]);
++        assert_eq!(body["input"][4]["role"], "developer");
++        assert_eq!(body["input"][5]["role"], "user");
++    }
++
++    #[test]
++    fn moves_hook_context_between_call_and_output() {
++        let mut body = json!({"model":"ccs-kimi/k3.1-pro","input":[call("a"),notice(),output("a"),user()]});
++        normalize_codex_kimi_tool_sequence(&mut body).unwrap();
++        assert_eq!(body["input"][1]["type"], "function_call_output");
++        assert_eq!(body["input"][2]["role"], "developer");
++    }
++
++    #[test]
++    fn leaves_non_kimi_and_valid_kimi_requests_unchanged() {
++        let original = json!({"model":"gpt-other","input":[call("a"),notice(),output("a")]});
++        let mut body = original.clone();
++        assert_eq!(normalize_codex_kimi_tool_sequence(&mut body), Ok(0));
++        assert_eq!(body, original);
++
++        let original = json!({"model":"k3.1-pro","input":[call("a"),output("a"),notice(),user()]});
++        let mut body = original.clone();
++        assert_eq!(normalize_codex_kimi_tool_sequence(&mut body), Ok(0));
++        assert_eq!(body, original);
++    }
++
++    #[test]
++    fn ignores_internal_receipts_without_call_id() {
++        let receipt = json!({"type":"function_call_output","name":"create_thread","output":"receipt"});
++        let mut body = json!({"model":"kimi-k3.1-pro","input":[receipt,call("a"),output("a"),user()]});
++        assert_eq!(normalize_codex_kimi_tool_sequence(&mut body), Ok(0));
++        assert_eq!(body["input"][0]["name"], "create_thread");
++    }
++
++    #[test]
++    fn rejects_missing_output_without_inventing_one() {
++        let mut body = json!({"model":"kimi-k3","input":[call("a"),user()]});
++        assert!(normalize_codex_kimi_tool_sequence(&mut body).is_err());
++    }
++}

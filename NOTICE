@@ -1,0 +1,4 @@
+This repository contains an independent patch for CC Switch.
+Upstream: https://github.com/farion1231/cc-switch
+Upstream version used: 4.0.31, commit 3c76d3bda670297dd8c27d7d9be9b18a4c9143f5.
+CC Switch is distributed under the MIT License. No upstream endorsement is implied.
